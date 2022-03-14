@@ -41,6 +41,7 @@
 //M*/
 
 #include "precomp.hpp"
+#include <unordered_map>
 
 using namespace cv;
 using namespace cv::cuda;
@@ -49,6 +50,7 @@ using namespace cv::cuda;
 
 void cv::cuda::warpAffine(InputArray, OutputArray, InputArray, Size, int, int, Scalar, Stream&) { throw_no_cuda(); }
 void cv::cuda::buildWarpAffineMaps(InputArray, bool, Size, OutputArray, OutputArray, Stream&) { throw_no_cuda(); }
+void cv::cuda::warpPiecewiseAffine(InputArray, OutputArray, const std::vector<Point2f> &, const std::vector<Point2f> &) { throw_no_cuda() }
 
 void cv::cuda::warpPerspective(InputArray, OutputArray, InputArray, Size, int, int, Scalar, Stream&) { throw_no_cuda(); }
 void cv::cuda::buildWarpPerspectiveMaps(InputArray, bool, Size, OutputArray, OutputArray, Stream&) { throw_no_cuda(); }
@@ -178,6 +180,107 @@ namespace
                 cudaSafeCall( cudaDeviceSynchronize() );
         }
     };
+}
+
+void cv::cuda::warpPiecewiseAffine(InputArray _src, OutputArray _dst, std::vector<Point2f> &src_pts, std::vector<Point2f> &dst_pts)
+{
+    CV_Assert(src_pts.size() == dst_pts.size());
+    CV_Assert(src_pts.size() >= 3);
+
+    // Custom Hash class for point hashing in unordered map
+    class Hash
+    {
+    public:
+        size_t operator()(const Point2f &p) const
+        {
+            return p.x + p.y;
+        }
+    };
+
+    GpuMat src = _src.getGpuMat();
+    Size size = src.size();
+
+    Mat dstCpu(size, src.type(), Scalar(0, 0, 0));
+
+    std::unordered_map<Point2f, Point2f, Hash> srcDstMapping;
+    for (size_t i = 0; i < src_pts.size(); i++)
+    {
+        srcDstMapping[src_pts[i]] = dst_pts[i];
+    }
+
+    // Get initial triangulation
+    Subdiv2D subdiv = Subdiv2D(Rect(0, 0, size.width + 1, size.height + 1));
+    subdiv.insert(src_pts);
+    std::vector<cv::Vec6f> trianglesList;
+    subdiv.getTriangleList(trianglesList);
+
+    for (cv::Vec6f triList : trianglesList)
+    {
+        Point2f from[3];
+        Point2f to[3];
+        from[0] = Point2f(triList[0], triList[1]);
+        from[1] = Point2f(triList[2], triList[3]);
+        from[2] = Point2f(triList[4], triList[5]);
+
+        // destination triangle bounding rectangle border points
+        // used to reduce complexity of image reconstruction
+        float minx = INT_MAX, miny = INT_MAX;
+        float maxx = 0, maxy = 0;
+        // Get mapped to points
+        for (size_t i = 0; i < 3; i++)
+        {
+            Point2f pt = from[i];
+            to[i] = srcDstMapping[pt];
+            pt = to[i];
+            maxx = round(cv::max(pt.x, maxx));
+            maxy = round(cv::max(pt.y, maxy));
+            minx = round(cv::min(pt.x, minx));
+            miny = round(cv::min(pt.y, miny));
+        }
+        // skip if empty
+        if (int(maxx) == int(minx) || int(maxy) == int(miny))
+        {
+            continue;
+        }
+
+        Mat m = getAffineTransform(from, to);
+
+        GpuMat fulltransformed;
+        cuda::warpAffine(src, fulltransformed, m, size);
+
+        GpuMat transformedGpu = fulltransformed(Rect(minx, miny, maxx - minx, maxy - miny));
+        Mat transformed;
+        transformedGpu.download(transformed);
+
+        // Move points to cropped image
+        std::vector<Point> toInt;
+        for (auto pt : to)
+        {
+            toInt.push_back(Point(pt.x - minx, pt.y - miny));
+        }
+
+        // Construct mask over destination triangle
+        Mat addTo = dstCpu.rowRange(miny, maxy).colRange(minx, maxx);
+        Mat mask(transformed.size(), transformed.type(), Scalar(0, 0, 0));
+        fillPoly(mask, toInt, Scalar(1, 1, 1));
+        // Ignore mask on already set points
+        // this prevents lines that are created on border of destination triangles
+        mask.setTo(0, addTo != 0);
+
+        // crop to traingle
+        cv::multiply(transformed, mask, transformed);
+        // copy destination triangle to final image
+        cv::add(addTo, transformed, addTo);
+    }
+
+    Mat srcCpu;
+    src.download(srcCpu);
+
+    srcCpu.copyTo(dstCpu, dstCpu == 0);
+
+    _dst.create(size, src.type());
+    GpuMat dst = _dst.getGpuMat();
+    dst.upload(dstCpu);
 }
 
 void cv::cuda::warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, int flags, int borderMode, Scalar borderValue, Stream& stream)

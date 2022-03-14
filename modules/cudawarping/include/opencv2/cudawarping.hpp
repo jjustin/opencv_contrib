@@ -107,6 +107,17 @@ supported for now.
  */
 CV_EXPORTS_W void resize(InputArray src, OutputArray dst, Size dsize, double fx=0, double fy=0, int interpolation = INTER_LINEAR, Stream& stream = Stream::Null());
 
+/** @brief Applies an piecewise affine transformation to an image.
+
+@param _src Source image.
+@param _dst Destination image with the same type as src.
+@param src Points to transform.
+@param dst Point to where src should be transfomed to.
+
+@sa warpAffine
+    */
+CV_EXPORTS_W void warpPiecewiseAffine(InputArray _src, CV_OUT OutputArray _dst, std::vector<Point2f> &src, std::vector<Point2f> &dst);
+
 /** @brief Applies an affine transformation to an image.
 
 @param src Source image. CV_8U , CV_16U , CV_32S , or CV_32F depth and 1, 3, or 4 channels are
